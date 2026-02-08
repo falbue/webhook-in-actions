@@ -1,0 +1,14 @@
+services:
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile.webhook
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /opt/deploy:/apps:rw
+    environment:
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - DEPLOY_ROOT=/apps
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1500:2000"
