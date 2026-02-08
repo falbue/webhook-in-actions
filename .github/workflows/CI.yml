@@ -33,11 +33,12 @@ jobs:
               echo "release=false" >> $GITHUB_OUTPUT
             fi
           else
-            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "tag=false" >> $GITHUB_OUTPUT
             echo "release=false" >> $GITHUB_OUTPUT
           fi
   build:
     needs: check-tags
+    if: needs.check-tags.outputs.tag != 'false'
     runs-on: ubuntu-latest
     permissions:
       contents: read

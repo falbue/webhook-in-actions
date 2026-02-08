@@ -1,8 +1,6 @@
 services:
   webhook:
-    build:
-      context: .
-      dockerfile: Dockerfile.webhook
+    image: ghcr.io/falbue/webhook-in-actions:latest
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /opt/deploy:/apps:rw
@@ -11,4 +9,4 @@ services:
       - DEPLOY_ROOT=/apps
     restart: unless-stopped
     ports:
-      - "127.0.0.1:1500:2000"
+      - "127.0.0.1:1500:8080"
