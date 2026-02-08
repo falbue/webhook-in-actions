@@ -18,9 +18,6 @@ RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
 COPY webhook_deployer.py .
 
-RUN useradd --create-home --shell /bin/false appuser && \
-    chown -R appuser:appuser /app
-USER appuser
 
 EXPOSE 8080
 CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8080", "webhook_deployer:app"]
