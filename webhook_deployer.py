@@ -5,6 +5,7 @@ import subprocess
 import logging
 from pathlib import Path
 from flask import Flask, request, abort, jsonify
+import base64
 
 # Настройка логирования
 logging.basicConfig(
@@ -44,79 +45,56 @@ def verify_signature(payload: bytes, sig_header: str) -> bool:
     return hmac.compare_digest(expected, sig_header)
 
 
-def ensure_compose_file(repo_path: Path, full_repo: str, tag: str) -> Path:
-    """Гарантированно создаёт/перезаписывает docker-compose.yml с актуальным тегом."""
-    owner, repo_name = full_repo.split("/", 1)
-    external_port = get_port_for_repo(owner, repo_name)
-    compose_content = f"""version: '3.8'
-services:
-  app:
-    image: ghcr.io/{full_repo}:{tag}
-    env_file:
-      - .env
-    environment:
-      - IN_DOCKER=1
-    ports:
-      - "{external_port}:5000"
-    restart: unless-stopped
-"""
-    compose_file = repo_path / "docker-compose.yml"
-    compose_file.write_text(compose_content, encoding="utf-8")
-    logger.info(
-        f"✅ docker-compose.yml обновлён для {full_repo} (тег: {tag}, порт: {external_port})"
-    )
-    return compose_file
-
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # === Валидация подписи ===
+    # === Валидация подписи — без изменений ===
     sig = request.headers.get("X-Hub-Signature-256")
     payload = request.get_data()
     if not verify_signature(payload, sig):  # type: ignore
         logger.warning("❌ Неверная подпись вебхука")
         abort(403, description="Invalid signature")
 
-    # === Парсинг и валидация данных ===
+    # === Парсинг данных ===
     try:
         data = request.get_json()
         if not data:
             abort(400, description="Empty payload")
         full_repo = data.get("repo", "").strip()
         tag = data.get("tag", "").strip()
+        compose_b64 = data.get("compose_b64", "").strip()
     except Exception as e:
         logger.error(f"❌ Ошибка парсинга JSON: {e}")
         abort(400, description="Invalid JSON")
 
-    if (
-        not full_repo
-        or full_repo.count("/") != 1
-        or not all(c.isalnum() or c in "-_./" for c in full_repo)
-    ):
-        logger.error(f"❌ Некорректный формат репозитория: {full_repo}")
+    if not full_repo or full_repo.count("/") != 1:
         abort(400, description="Invalid repo format")
     if not tag:
-        logger.error("❌ Отсутствует тег в запросе")
         abort(400, description="Tag is required")
 
     owner, repo_name = full_repo.split("/", 1)
     repo_path = DEPLOY_ROOT / owner / repo_name
     repo_path.mkdir(parents=True, exist_ok=True)
 
-    # === Генерация docker-compose.yml с актуальным тегом ===
-    try:
-        compose_file = ensure_compose_file(repo_path, full_repo, tag)
-    except Exception as e:
-        logger.exception(f"💥 Ошибка создания docker-compose.yml: {e}")
-        return jsonify(
-            {"error": "Compose file generation failed", "details": str(e)}
-        ), 500
+    compose_file = repo_path / "docker-compose.yml"
 
-    # === Выполнение docker compose команд ===
+    # === Используем переданный compose или fallback ===
+    if compose_b64:
+        try:
+            compose_content = base64.b64decode(compose_b64).decode("utf-8")
+            compose_file.write_text(compose_content, encoding="utf-8")
+            logger.info(
+                f"✅ docker-compose.yml получен из вебхука для {full_repo}:{tag}"
+            )
+        except Exception as e:
+            logger.exception(f"💥 Ошибка декодирования compose_b64: {e}")
+            return jsonify({"error": "Invalid compose_b64"}), 400
+    else:
+        return abort(400, description="docker-compose.yml не найден")
+
+    # === Запуск docker compose — БЕЗ ИЗМЕНЕНИЙ ===
     try:
         logger.info(f"🔄 Запуск деплоя {full_repo}:{tag} в {repo_path}")
 
-        # Pull с явным указанием файла (надёжнее)
         pull = subprocess.run(
             ["docker", "compose", "-f", str(compose_file), "pull"],
             cwd=repo_path,
@@ -125,14 +103,9 @@ def webhook():
             timeout=120,
         )
         if pull.returncode != 0:
-            logger.error(
-                f"❌ docker compose pull failed:\nSTDOUT: {pull.stdout}\nSTDERR: {pull.stderr}"
-            )
-            return jsonify(
-                {"error": "Pull failed", "stdout": pull.stdout, "stderr": pull.stderr}
-            ), 500
+            logger.error(f"❌ docker compose pull failed:\n{pull.stderr}")
+            return jsonify({"error": "Pull failed", "stderr": pull.stderr}), 500
 
-        # Up
         up = subprocess.run(
             [
                 "docker",
@@ -149,29 +122,15 @@ def webhook():
             timeout=120,
         )
         if up.returncode != 0:
-            logger.error(
-                f"❌ docker compose up failed:\nSTDOUT: {up.stdout}\nSTDERR: {up.stderr}"
-            )
-            return jsonify(
-                {"error": "Deploy failed", "stdout": up.stdout, "stderr": up.stderr}
-            ), 500
+            logger.error(f"❌ docker compose up failed:\n{up.stderr}")
+            return jsonify({"error": "Deploy failed", "stderr": up.stderr}), 500
 
-        logger.info(
-            f"✅ Успешный деплой {full_repo}:{tag} на порту {get_port_for_repo(owner, repo_name)}"
-        )
-        return jsonify(
-            {
-                "status": "success",
-                "repo": full_repo,
-                "tag": tag,
-                "port": get_port_for_repo(owner, repo_name),
-                "message": "Deployed successfully",
-            }
-        ), 200
+        logger.info(f"✅ Успешный деплой {full_repo}:{tag}")
+        return jsonify({"status": "success", "repo": full_repo, "tag": tag}), 200
 
     except subprocess.TimeoutExpired:
         logger.exception("💥 Таймаут выполнения docker compose")
         return jsonify({"error": "Deployment timeout"}), 500
     except Exception as e:
         logger.exception(f"💥 Критическая ошибка деплоя: {e}")
-        return jsonify({"error": "Internal server error", "details": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
