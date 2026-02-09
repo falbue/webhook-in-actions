@@ -48,8 +48,7 @@ def ensure_compose_file(repo_path: Path, full_repo: str, tag: str) -> Path:
     """Гарантированно создаёт/перезаписывает docker-compose.yml с актуальным тегом."""
     owner, repo_name = full_repo.split("/", 1)
     external_port = get_port_for_repo(owner, repo_name)
-    compose_content = f"""version: '3.8'
-services:
+    compose_content = f"""services:
   app:
     image: ghcr.io/{full_repo}:{tag}
     env_file:
@@ -59,7 +58,14 @@ services:
     ports:
       - "{external_port}:5000"
     restart: unless-stopped
-"""
+    networks:
+      - db-net
+    volumes:
+      - ./data:/data
+
+networks:
+  db-net:
+    external: true"""
     compose_file = repo_path / "docker-compose.yml"
     compose_file.write_text(compose_content, encoding="utf-8")
     logger.info(
