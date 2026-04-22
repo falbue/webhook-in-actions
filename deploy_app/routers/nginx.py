@@ -7,14 +7,18 @@ from sqlmodel import Session
 from deploy_app.config import ENABLE_NGINX_GATEWAY
 from deploy_app.db import get_session
 from deploy_app.deps import require_auth
-from deploy_app.models import Deployment, User
+from deploy_app.models import Deployment, User, UserRole
 from deploy_app.schemas import (
     NginxCertbotRequest,
     NginxCustomConfigRequest,
     NginxPresetApiRequest,
     NginxPresetPreviewRequest,
 )
-from deploy_app.services.deployments import can_access_deployment
+from deploy_app.services.deployments import (
+    build_project_name,
+    get_deployment_by_owner_repo,
+    validate_owner_repo,
+)
 from deploy_app.services.docker_ops import (
     docker_compose_run_certbot,
     docker_compose_up_no_pull,
@@ -39,27 +43,15 @@ def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9_-]", "-", value.lower())
 
 
-def build_repo_slug(owner_repo: str) -> str:
-    return slugify(owner_repo.split("/", 1)[1])
-
-
-def build_owner_slug(owner_username: str) -> str:
-    return slugify(owner_username)
-
-
-def build_app_project_name(owner_repo: str, owner_username: str) -> str:
-    return f"{build_owner_slug(owner_username)}-{build_repo_slug(owner_repo)}"
-
-
 def get_deployment_for_nginx(
     session: Session,
-    deployment_id: int,
+    owner_repo: str,
     current_user: User,
 ) -> tuple[Deployment, User]:
-    deployment = session.get(Deployment, deployment_id)
+    deployment = get_deployment_by_owner_repo(session, owner_repo)
     if not deployment:
         raise HTTPException(status_code=404, detail="Деплой не найден")
-    if not can_access_deployment(current_user, deployment):
+    if current_user.role != UserRole.ADMIN and deployment.owner_id != current_user.id:
         raise HTTPException(status_code=403, detail="Нет доступа к деплою")
 
     owner = session.get(User, deployment.owner_id)
@@ -68,8 +60,8 @@ def get_deployment_for_nginx(
     return deployment, owner
 
 
-def conf_file_path(compose_path: Path, deployment_id: int, domain: str) -> Path:
-    conf_name = f"dpl-{deployment_id}-{slugify(domain)}.conf"
+def conf_file_path(compose_path: Path, owner_repo: str, domain: str) -> Path:
+    conf_name = f"dpl-{slugify(owner_repo)}-{slugify(domain)}.conf"
     return compose_path.parent / "conf.d" / conf_name
 
 
@@ -141,18 +133,19 @@ server {{
 """
 
 
-@router.post("/{deployment_id}/nginx/preset-api")
+@router.post("/{owner_repo:path}/nginx/preset-api")
 def set_nginx_preset_api(
-    deployment_id: int,
+    owner_repo: str,
     body: NginxPresetApiRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
     ensure_nginx_gateway_enabled()
-    deployment, owner = get_deployment_for_nginx(session, deployment_id, current_user)
+    validate_owner_repo(owner_repo)
+    deployment, owner = get_deployment_for_nginx(session, owner_repo, current_user)
     compose_path = ensure_gateway_stack()
 
-    project_name = build_app_project_name(deployment.owner_repo, owner.username)
+    project_name = build_project_name(deployment.owner_repo, owner.username)
     app_host = f"{project_name}-app-1"
     config = render_api_preset_config(
         domain=body.domain,
@@ -162,22 +155,23 @@ def set_nginx_preset_api(
         force_https=body.force_https,
     )
 
-    conf_path = conf_file_path(compose_path, deployment_id, body.domain)
+    conf_path = conf_file_path(compose_path, owner_repo, body.domain)
     write_config_with_validation(conf_path, config, compose_path)
 
     docker_compose_up_no_pull(compose_path)
     return {"status": "ok", "config_path": str(conf_path)}
 
 
-@router.post("/{deployment_id}/nginx/preview/preset-api")
+@router.post("/{owner_repo:path}/nginx/preview/preset-api")
 def preview_nginx_preset_api(
-    deployment_id: int,
+    owner_repo: str,
     body: NginxPresetPreviewRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
-    deployment, owner = get_deployment_for_nginx(session, deployment_id, current_user)
-    project_name = build_app_project_name(deployment.owner_repo, owner.username)
+    validate_owner_repo(owner_repo)
+    deployment, owner = get_deployment_for_nginx(session, owner_repo, current_user)
+    project_name = build_project_name(deployment.owner_repo, owner.username)
     app_host = f"{project_name}-app-1"
     config = render_api_preset_config(
         domain=body.domain,
@@ -189,36 +183,38 @@ def preview_nginx_preset_api(
     return {"config": config}
 
 
-@router.put("/{deployment_id}/nginx/custom")
+@router.put("/{owner_repo:path}/nginx/custom")
 def set_nginx_custom_config(
-    deployment_id: int,
+    owner_repo: str,
     body: NginxCustomConfigRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
     ensure_nginx_gateway_enabled()
-    get_deployment_for_nginx(session, deployment_id, current_user)
+    validate_owner_repo(owner_repo)
+    get_deployment_for_nginx(session, owner_repo, current_user)
     compose_path = ensure_gateway_stack()
 
-    conf_path = conf_file_path(compose_path, deployment_id, body.domain)
+    conf_path = conf_file_path(compose_path, owner_repo, body.domain)
     write_config_with_validation(conf_path, body.content.strip() + "\n", compose_path)
 
     docker_compose_up_no_pull(compose_path)
     return {"status": "ok", "config_path": str(conf_path)}
 
 
-@router.post("/{deployment_id}/nginx/certbot")
+@router.post("/{owner_repo:path}/nginx/certbot")
 def activate_certbot(
-    deployment_id: int,
+    owner_repo: str,
     body: NginxCertbotRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
     ensure_nginx_gateway_enabled()
-    deployment, owner = get_deployment_for_nginx(session, deployment_id, current_user)
+    validate_owner_repo(owner_repo)
+    deployment, owner = get_deployment_for_nginx(session, owner_repo, current_user)
     compose_path = ensure_gateway_stack()
 
-    project_name = build_app_project_name(deployment.owner_repo, owner.username)
+    project_name = build_project_name(deployment.owner_repo, owner.username)
     app_host = f"{project_name}-app-1"
 
     pre_config = render_api_preset_config(
@@ -228,7 +224,7 @@ def activate_certbot(
         use_ssl=False,
         force_https=False,
     )
-    conf_path = conf_file_path(compose_path, deployment_id, body.domain)
+    conf_path = conf_file_path(compose_path, owner_repo, body.domain)
     write_config_with_validation(conf_path, pre_config, compose_path)
     docker_compose_up_no_pull(compose_path)
 
@@ -252,18 +248,19 @@ def activate_certbot(
     return {"status": "ok", "config_path": str(conf_path)}
 
 
-@router.delete("/{deployment_id}/nginx")
+@router.delete("/{owner_repo:path}/nginx")
 def delete_nginx_config(
-    deployment_id: int,
+    owner_repo: str,
     domain: str,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
     ensure_nginx_gateway_enabled()
-    get_deployment_for_nginx(session, deployment_id, current_user)
+    validate_owner_repo(owner_repo)
+    get_deployment_for_nginx(session, owner_repo, current_user)
     compose_path = ensure_gateway_stack()
 
-    conf_path = conf_file_path(compose_path, deployment_id, domain)
+    conf_path = conf_file_path(compose_path, owner_repo, domain)
     if conf_path.exists():
         old_content = conf_path.read_text(encoding="utf-8")
         conf_path.unlink()

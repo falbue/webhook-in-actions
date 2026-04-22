@@ -146,15 +146,15 @@ curl http://127.0.0.1:1500/health
 
 - `POST /deployments`
 - `GET /deployments`
-- `POST /deployments/{deployment_id}/redeploy`
-- `POST /deployments/{deployment_id}/apply`
-- `DELETE /deployments/{deployment_id}`
+- `POST /deployments/{owner/repo}/redeploy`
+- `POST /deployments/{owner/repo}/apply`
+- `DELETE /deployments/{owner/repo}`
 
 ### ENV
 
-- `GET /deployments/{deployment_id}/env`
-- `PUT /deployments/{deployment_id}/env` (полная замена)
-- `PATCH /deployments/{deployment_id}/env` (частичное обновление)
+- `GET /deployments/{owner/repo}/env`
+- `PUT /deployments/{owner/repo}/env` (полная замена)
+- `PATCH /deployments/{owner/repo}/env` (частичное обновление)
 
 ### Базы данных
 
@@ -165,11 +165,11 @@ curl http://127.0.0.1:1500/health
 
 ### Nginx и SSL
 
-- `POST /deployments/{deployment_id}/nginx/preview/preset-api`
-- `POST /deployments/{deployment_id}/nginx/preset-api`
-- `PUT /deployments/{deployment_id}/nginx/custom`
-- `POST /deployments/{deployment_id}/nginx/certbot`
-- `DELETE /deployments/{deployment_id}/nginx?domain=example.com`
+- `POST /deployments/{owner/repo}/nginx/preview/preset-api`
+- `POST /deployments/{owner/repo}/nginx/preset-api`
+- `PUT /deployments/{owner/repo}/nginx/custom`
+- `POST /deployments/{owner/repo}/nginx/certbot`
+- `DELETE /deployments/{owner/repo}/nginx?domain=example.com`
 
 ## Примеры запросов
 
@@ -194,7 +194,7 @@ curl -X POST http://127.0.0.1:1500/deployments \
 Обновить ENV частично:
 
 ```bash
-curl -X PATCH http://127.0.0.1:1500/deployments/1/env \
+curl -X PATCH http://127.0.0.1:1500/deployments/falbue/swipe-refactor/env \
   -H "X-API-Key: USER_KEY" \
   -H "Content-Type: application/json" \
   -d '{"values":{"APP_ENV":"prod","TOKEN":"secret"}}'
@@ -206,7 +206,7 @@ curl -X PATCH http://127.0.0.1:1500/deployments/1/env \
 curl -X POST http://127.0.0.1:1500/databases \
   -H "X-API-Key: USER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"name":"main","deployment_id":1,"postgres_image":"postgres:18","postgres_user":"db_user","postgres_password":"db_pass","postgres_db":"db_name","run_deploy":true}'
+  -d '{"name":"main","deployment_repo":"falbue/swipe-refactor","postgres_image":"postgres:18","postgres_user":"db_user","postgres_password":"db_pass","postgres_db":"db_name","run_deploy":true}'
 ```
 
 Запустить БД, созданную ранее с `run_deploy=false`:
@@ -242,14 +242,14 @@ curl -X DELETE http://127.0.0.1:1500/databases/1 \
 Удалить деплой:
 
 ```bash
-curl -X DELETE http://127.0.0.1:1500/deployments/1 \
+curl -X DELETE http://127.0.0.1:1500/deployments/falbue/swipe-refactor \
   -H "X-API-Key: USER_KEY"
 ```
 
 Создать nginx preset для API:
 
 ```bash
-curl -X POST http://127.0.0.1:1500/deployments/1/nginx/preset-api \
+curl -X POST http://127.0.0.1:1500/deployments/falbue/swipe-refactor/nginx/preset-api \
   -H "X-API-Key: USER_KEY" \
   -H "Content-Type: application/json" \
   -d '{"domain":"api.example.com","force_https":true}'
@@ -258,7 +258,7 @@ curl -X POST http://127.0.0.1:1500/deployments/1/nginx/preset-api \
 Предпросмотр preset-конфига без сохранения:
 
 ```bash
-curl -X POST http://127.0.0.1:1500/deployments/1/nginx/preview/preset-api \
+curl -X POST http://127.0.0.1:1500/deployments/falbue/swipe-refactor/nginx/preview/preset-api \
   -H "X-API-Key: USER_KEY" \
   -H "Content-Type: application/json" \
   -d '{"domain":"api.example.com","force_https":true,"use_ssl":false}'
@@ -267,7 +267,7 @@ curl -X POST http://127.0.0.1:1500/deployments/1/nginx/preview/preset-api \
 Выпустить SSL сертификат через certbot и включить HTTPS:
 
 ```bash
-curl -X POST http://127.0.0.1:1500/deployments/1/nginx/certbot \
+curl -X POST http://127.0.0.1:1500/deployments/falbue/swipe-refactor/nginx/certbot \
   -H "X-API-Key: USER_KEY" \
   -H "Content-Type: application/json" \
   -d '{"domain":"api.example.com","email":"ops@example.com","staging":false}'
@@ -298,7 +298,7 @@ curl -X POST http://127.0.0.1:1500/deployments/1/nginx/certbot \
 Перед сохранением и применением nginx-конфига API выполняет `nginx -t`; при ошибке конфиг откатывается.
 
 Если `ENABLE_NGINX_GATEWAY=false`, встроенный nginx/certbot не используется,
-`/deployments/{id}/nginx/*` endpoint'ы возвращают `409`, а app-контейнеры не
+`/deployments/{owner/repo}/nginx/*` endpoint'ы возвращают `409`, а app-контейнеры не
 подключаются к `web-net`.
 
 

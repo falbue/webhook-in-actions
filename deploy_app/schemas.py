@@ -66,7 +66,7 @@ class EnvPatchRequest(BaseModel):
 
 class DatabaseCreateRequest(BaseModel):
     name: str = PydanticField(min_length=3, max_length=64)
-    deployment_id: Optional[int] = None
+    deployment_repo: Optional[str] = PydanticField(default=None, description="owner/repo")
     postgres_image: str = PydanticField(min_length=1)
     postgres_user: str = PydanticField(min_length=1)
     postgres_password: str = PydanticField(min_length=1)
@@ -77,7 +77,7 @@ class DatabaseCreateRequest(BaseModel):
 class DatabaseRead(BaseModel):
     id: int
     owner_id: int
-    deployment_id: Optional[int]
+    deployment_repo: Optional[str]
     name: str
     service_name: str
     host_port: int

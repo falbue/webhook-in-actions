@@ -15,12 +15,37 @@ from deploy_app.config import (
 from deploy_app.models import DatabaseInstance, Deployment, User, UserRole
 
 
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9_-]", "-", value.lower())
+
+
 def validate_owner_repo(owner_repo: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", owner_repo):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="owner_repo должен быть в формате owner/repo",
         )
+
+
+def split_owner_repo(owner_repo: str) -> tuple[str, str]:
+    return owner_repo.split("/", 1)
+
+
+def build_repo_slug(owner_repo: str) -> str:
+    _, repo_name = split_owner_repo(owner_repo)
+    return slugify(repo_name)
+
+
+def build_owner_slug(owner_username: str) -> str:
+    return slugify(owner_username)
+
+
+def build_project_name(owner_repo: str, owner_username: str) -> str:
+    return f"{build_owner_slug(owner_username)}-{build_repo_slug(owner_repo)}"
+
+
+def get_deployment_by_owner_repo(session: Session, owner_repo: str) -> Deployment | None:
+    return session.exec(select(Deployment).where(Deployment.owner_repo == owner_repo)).first()
 
 
 def write_env_file(path: Path, content: str) -> None:

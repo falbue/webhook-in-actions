@@ -1,6 +1,5 @@
 from datetime import datetime
 from pathlib import Path
-import re
 import shutil
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,7 +20,11 @@ from deploy_app.services.deployments import (
     allocate_app_port,
     can_access_deployment,
     check_deploy_limit,
+    build_owner_slug,
+    build_project_name,
+    build_repo_slug,
     dump_env,
+    get_deployment_by_owner_repo,
     get_docker_config_dir_for_user,
     parse_env,
     validate_owner_repo,
@@ -36,27 +39,14 @@ from deploy_app.services.docker_ops import (
 router = APIRouter(prefix="/deployments", tags=["deployments"])
 
 
-def build_repo_dir_name(owner_repo: str) -> str:
-    repo_name = owner_repo.split("/", 1)[1]
-    raw_name = repo_name
-    return re.sub(r"[^a-z0-9_-]", "-", raw_name.lower())
-
-
-def build_owner_dir_name(owner_username: str) -> str:
-    return re.sub(r"[^a-z0-9_-]", "-", owner_username.lower())
-
-
-def build_app_project_name(owner_repo: str, owner_username: str) -> str:
-    repo_name = build_repo_dir_name(owner_repo)
-    owner_name = build_owner_dir_name(owner_username)
-    raw_name = f"{owner_name}-{repo_name}"
-    return re.sub(r"[^a-z0-9_-]", "-", raw_name.lower())
-
-
-def get_deployment_or_404(session: Session, deployment_id: int) -> Deployment:
-    deployment = session.get(Deployment, deployment_id)
+def get_deployment_for_repo(
+    session: Session, owner_repo: str, current_user: User
+) -> Deployment:
+    deployment = get_deployment_by_owner_repo(session, owner_repo)
     if not deployment:
         raise HTTPException(status_code=404, detail="Деплой не найден")
+    if not can_access_deployment(current_user, deployment):
+        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
     return deployment
 
 
@@ -70,19 +60,16 @@ def create_deployment(
     check_deploy_limit(session, current_user)
 
     existing = session.exec(
-        select(Deployment).where(
-            Deployment.owner_id == current_user.id,
-            Deployment.owner_repo == body.owner_repo,
-        )
+        select(Deployment).where(Deployment.owner_repo == body.owner_repo)
     ).first()
     if existing:
         raise HTTPException(
-            status_code=409, detail="Этот репозиторий уже задеплоен пользователем"
+            status_code=409, detail="Этот репозиторий уже задеплоен"
         )
 
-    owner_name = build_owner_dir_name(current_user.username)
-    repo_dir_name = build_repo_dir_name(body.owner_repo)
-    project_name = build_app_project_name(body.owner_repo, current_user.username)
+    owner_name = build_owner_slug(current_user.username)
+    repo_dir_name = build_repo_slug(body.owner_repo)
+    project_name = build_project_name(body.owner_repo, current_user.username)
     app_port = allocate_app_port(session, current_user)
     deploy_path = DEPLOY_ROOT / owner_name / repo_dir_name
     deploy_path.mkdir(parents=True, exist_ok=True)
@@ -157,16 +144,15 @@ def list_deployments(
     ]
 
 
-@router.post("/{deployment_id}/redeploy", response_model=DeploymentRead)
+@router.post("/{owner_repo:path}/redeploy", response_model=DeploymentRead)
 def redeploy(
-    deployment_id: int,
+    owner_repo: str,
     body: DeploymentRedeployRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> DeploymentRead:
-    deployment = get_deployment_or_404(session, deployment_id)
-    if not can_access_deployment(current_user, deployment):
-        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+    validate_owner_repo(owner_repo)
+    deployment = get_deployment_for_repo(session, owner_repo, current_user)
 
     deployment.tag = body.tag
     deployment.updated_at = datetime.utcnow()
@@ -174,7 +160,7 @@ def redeploy(
     owner = session.get(User, deployment.owner_id)
     if not owner:
         raise HTTPException(status_code=500, detail="Владелец деплоя не найден")
-    project_name = build_app_project_name(deployment.owner_repo, owner.username)
+    project_name = build_project_name(deployment.owner_repo, owner.username)
     compose_path = deploy_path / "docker-compose.yml"
     compose_path.write_text(
         render_app_compose(
@@ -211,45 +197,42 @@ def redeploy(
     )
 
 
-@router.get("/{deployment_id}/env")
+@router.get("/{owner_repo:path}/env")
 def get_env(
-    deployment_id: int,
+    owner_repo: str,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, object]:
-    deployment = get_deployment_or_404(session, deployment_id)
-    if not can_access_deployment(current_user, deployment):
-        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+    validate_owner_repo(owner_repo)
+    deployment = get_deployment_for_repo(session, owner_repo, current_user)
     env_path = Path(deployment.deploy_path) / ".env"
     content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
-    return {"deployment_id": deployment.id, "env": parse_env(content), "raw": content}
+    return {"owner_repo": deployment.owner_repo, "env": parse_env(content), "raw": content}
 
 
-@router.put("/{deployment_id}/env")
+@router.put("/{owner_repo:path}/env")
 def replace_env(
-    deployment_id: int,
+    owner_repo: str,
     body: EnvReplaceRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
-    deployment = get_deployment_or_404(session, deployment_id)
-    if not can_access_deployment(current_user, deployment):
-        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+    validate_owner_repo(owner_repo)
+    deployment = get_deployment_for_repo(session, owner_repo, current_user)
     env_path = Path(deployment.deploy_path) / ".env"
     write_env_file(env_path, body.content)
     return {"status": "ok"}
 
 
-@router.patch("/{deployment_id}/env")
+@router.patch("/{owner_repo:path}/env")
 def patch_env(
-    deployment_id: int,
+    owner_repo: str,
     body: EnvPatchRequest,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
-    deployment = get_deployment_or_404(session, deployment_id)
-    if not can_access_deployment(current_user, deployment):
-        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+    validate_owner_repo(owner_repo)
+    deployment = get_deployment_for_repo(session, owner_repo, current_user)
 
     env_path = Path(deployment.deploy_path) / ".env"
     existing_content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
@@ -259,15 +242,14 @@ def patch_env(
     return {"status": "ok"}
 
 
-@router.post("/{deployment_id}/apply")
+@router.post("/{owner_repo:path}/apply")
 def apply_deployment(
-    deployment_id: int,
+    owner_repo: str,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
-    deployment = get_deployment_or_404(session, deployment_id)
-    if not can_access_deployment(current_user, deployment):
-        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+    validate_owner_repo(owner_repo)
+    deployment = get_deployment_for_repo(session, owner_repo, current_user)
 
     compose_path = Path(deployment.deploy_path) / "docker-compose.yml"
     if not compose_path.exists():
@@ -287,15 +269,14 @@ def apply_deployment(
     return {"status": "ok"}
 
 
-@router.delete("/{deployment_id}")
+@router.delete("/{owner_repo:path}")
 def delete_deployment(
-    deployment_id: int,
+    owner_repo: str,
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
-    deployment = get_deployment_or_404(session, deployment_id)
-    if not can_access_deployment(current_user, deployment):
-        raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+    validate_owner_repo(owner_repo)
+    deployment = get_deployment_for_repo(session, owner_repo, current_user)
 
     linked_dbs = session.exec(
         select(DatabaseInstance).where(DatabaseInstance.deployment_id == deployment.id)

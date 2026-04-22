@@ -8,13 +8,14 @@ from sqlmodel import Session, col, select
 from deploy_app.config import DB_ROOT
 from deploy_app.db import get_session
 from deploy_app.deps import require_auth
-from deploy_app.models import DatabaseInstance, User, UserRole
-from deploy_app.routers.deployments import get_deployment_or_404
+from deploy_app.models import DatabaseInstance, Deployment, User, UserRole
 from deploy_app.schemas import DatabaseCreateRequest, DatabaseRead
 from deploy_app.services.deployments import (
     allocate_db_port,
     can_access_deployment,
+    get_deployment_by_owner_repo,
     get_docker_config_dir_for_user,
+    validate_owner_repo,
 )
 from deploy_app.services.docker_ops import (
     docker_compose_apply,
@@ -26,18 +27,18 @@ router = APIRouter(prefix="/databases", tags=["databases"])
 
 
 def build_owner_dir_name(owner_username: str) -> str:
-    return re.sub(r"[^a-z0-9_-]", "-", owner_username.lower())
+	return re.sub(r"[^a-z0-9_-]", "-", owner_username.lower())
 
 
 def get_database_or_404(session: Session, database_id: int) -> DatabaseInstance:
-    db_instance = session.get(DatabaseInstance, database_id)
-    if not db_instance:
-        raise HTTPException(status_code=404, detail="База данных не найдена")
-    return db_instance
+	db_instance = session.get(DatabaseInstance, database_id)
+	if not db_instance:
+		raise HTTPException(status_code=404, detail="База данных не найдена")
+	return db_instance
 
 
 def can_access_database(current_user: User, db_instance: DatabaseInstance) -> bool:
-    return current_user.role == UserRole.ADMIN or db_instance.owner_id == current_user.id
+	return current_user.role == UserRole.ADMIN or db_instance.owner_id == current_user.id
 
 
 @router.post("", response_model=DatabaseRead)
@@ -50,9 +51,12 @@ def create_database(
     if len(safe_name) < 3:
         raise HTTPException(status_code=422, detail="Некорректное имя базы")
 
-    deployment_id = body.deployment_id
-    if deployment_id is not None:
-        deployment = get_deployment_or_404(session, deployment_id)
+    deployment = None
+    if body.deployment_repo is not None:
+        validate_owner_repo(body.deployment_repo)
+        deployment = get_deployment_by_owner_repo(session, body.deployment_repo)
+        if not deployment:
+            raise HTTPException(status_code=404, detail="Деплой не найден")
         if not can_access_deployment(current_user, deployment):
             raise HTTPException(status_code=403, detail="Нет доступа к деплою")
 
@@ -63,9 +67,7 @@ def create_database(
         )
     ).first()
     if duplicate:
-        raise HTTPException(
-            status_code=409, detail="База с таким именем уже существует"
-        )
+        raise HTTPException(status_code=409, detail="База с таким именем уже существует")
 
     owner_name = build_owner_dir_name(current_user.username)
     host_port = allocate_db_port(session, current_user)
@@ -91,7 +93,7 @@ def create_database(
 
     db_instance = DatabaseInstance(
         owner_id=current_user.id or 0,
-        deployment_id=deployment_id,
+        deployment_id=deployment.id if deployment else None,
         name=safe_name,
         service_name=service_name,
         host_port=host_port,
@@ -116,14 +118,12 @@ def create_database(
             db_instance.status = f"error: {exc}"
             session.add(db_instance)
             session.commit()
-            raise HTTPException(
-                status_code=500, detail=f"Не удалось поднять БД: {exc}"
-            ) from exc
+            raise HTTPException(status_code=500, detail=f"Не удалось поднять БД: {exc}") from exc
 
     return DatabaseRead(
         id=db_instance.id or 0,
         owner_id=db_instance.owner_id,
-        deployment_id=db_instance.deployment_id,
+        deployment_repo=deployment.owner_repo if deployment else None,
         name=db_instance.name,
         service_name=db_instance.service_name,
         host_port=db_instance.host_port,
@@ -137,20 +137,43 @@ def create_database(
 def list_databases(
     current_user: User = Depends(require_auth),
     session: Session = Depends(get_session),
-    deployment_id: int | None = Query(default=None),
+    deployment_repo: str | None = Query(default=None),
 ) -> list[DatabaseRead]:
     query = select(DatabaseInstance).order_by(col(DatabaseInstance.id))
     if current_user.role != UserRole.ADMIN:
         query = query.where(DatabaseInstance.owner_id == current_user.id)
-    if deployment_id is not None:
-        query = query.where(DatabaseInstance.deployment_id == deployment_id)
+
+    deployment = None
+    if deployment_repo is not None:
+        validate_owner_repo(deployment_repo)
+        deployment = get_deployment_by_owner_repo(session, deployment_repo)
+        if not deployment:
+            return []
+        if current_user.role != UserRole.ADMIN and deployment.owner_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Нет доступа к деплою")
+        query = query.where(DatabaseInstance.deployment_id == deployment.id)
 
     dbs = session.exec(query).all()
+    linked_ids = {db.deployment_id for db in dbs if db.deployment_id is not None}
+    linked_deployments = {}
+    if linked_ids:
+        linked_deployments = {
+            dep.id: dep
+            for dep in session.exec(
+                select(Deployment).where(Deployment.id.in_(linked_ids))
+            ).all()
+            if dep.id is not None
+        }
+
     return [
         DatabaseRead(
             id=db.id or 0,
             owner_id=db.owner_id,
-            deployment_id=db.deployment_id,
+            deployment_repo=(
+                linked_deployments[db.deployment_id].owner_repo
+                if db.deployment_id in linked_deployments
+                else None
+            ),
             name=db.name,
             service_name=db.service_name,
             host_port=db.host_port,
@@ -191,9 +214,7 @@ def apply_database(
         db_instance.status = f"error: {exc}"
         session.add(db_instance)
         session.commit()
-        raise HTTPException(
-            status_code=500, detail=f"Не удалось запустить БД: {exc}"
-        ) from exc
+        raise HTTPException(status_code=500, detail=f"Не удалось запустить БД: {exc}") from exc
 
     return {"status": "ok"}
 
@@ -220,9 +241,7 @@ def delete_database(
                 docker_config_dir=get_docker_config_dir_for_user(owner),
             )
         except Exception as exc:
-            raise HTTPException(
-                status_code=500, detail=f"Не удалось удалить БД контейнер: {exc}"
-            ) from exc
+            raise HTTPException(status_code=500, detail=f"Не удалось удалить БД контейнер: {exc}") from exc
 
     db_dir = compose_path.parent
     if db_dir.exists():
